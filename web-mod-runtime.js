@@ -673,6 +673,31 @@
         await putMod(mod);
         return mod;
     }
+    // Two stored mod records that hash to the same archive content are the same mod
+    // installed twice (e.g. once under an old id, once re-migrated under a new one).
+    // Keep a single copy -- preferring whichever is enabled -- and drop the rest, so
+    // its jokers/decks/tarots/etc. don't get injected into the game twice.
+    async function dedupeStoredMods(stored) {
+        const keepByHash = new Map;
+        const toDelete = [];
+        for (const mod of stored) {
+            if (!mod.archiveHash) continue;
+            const existing = keepByHash.get(mod.archiveHash);
+            if (!existing) {
+                keepByHash.set(mod.archiveHash, mod);
+                continue;
+            }
+            const keep = existing.enabled || !mod.enabled ? existing : mod;
+            const drop = keep === existing ? mod : existing;
+            keepByHash.set(mod.archiveHash, keep);
+            toDelete.push(drop);
+        }
+        for (const mod of toDelete) {
+            console.warn(`[ModRuntime] Removed duplicate installation of "${mod.name || mod.id}" (same mod was installed twice).`);
+            await deleteMod(mod.id);
+        }
+        return toDelete.length ? stored.filter(mod => !toDelete.includes(mod)) : stored;
+    }
     var MAX_ARCHIVE_BYTES = 100 * 1024 * 1024;
     var MAX_EXPANDED_BYTES = 300 * 1024 * 1024;
     var MAX_FILES = 3e3;
@@ -765,7 +790,7 @@
         const id = String(value ?? "").replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
         return id || fallback;
     }
-    function detectRoots(files, fallback) {
+    function detectRoots(files, fallback, preferredId) {
         const decoder = new TextDecoder;
         const roots = new Map;
         for (const file of files.filter(item => /\.json$/i.test(item.path))) {
@@ -786,7 +811,10 @@
         }
         if (!roots.size) roots.set("", {
             path: "",
-            id: normalizedId(fallback, "DownloadedMod"),
+            // Prefer a caller-supplied stable id (e.g. a legacy mod's existing id) over one
+            // derived from the display name, so re-installing/re-migrating the same mod
+            // doesn't mint a second, differently-cased id and leave a duplicate behind.
+            id: normalizedId(preferredId || fallback, "DownloadedMod"),
             name: fallback,
             dependencies: [],
             priority: 0
@@ -860,7 +888,7 @@
             path: wrapper ? file.path.slice(wrapper.length) : file.path
         })).filter(file => file.path);
         const fallback = input.displayName || input.name.replace(/\.(?:zip|tar|tar\.gz|tgz)$/i, "");
-        const roots = detectRoots(files, fallback);
+        const roots = detectRoots(files, fallback, input.preferredId);
         const Zip = window.JSZip;
         const canonical = new Zip;
         for (const file of files) canonical.file(file.path, file.bytes);
@@ -1560,14 +1588,31 @@ end`;
                 for (const legacy of stored.filter(mod => !mod.archiveHash || !mod.roots)) {
                     try {
                         const bytes = legacy.bytes instanceof Blob ? await legacy.bytes.arrayBuffer() : legacy.bytes instanceof Uint8Array ? legacy.bytes.slice().buffer : legacy.bytes;
-                        await installBrowserArchive({
+                        const installed = await installBrowserArchive({
                             name: legacy.fileName || `${legacy.id}.zip`,
                             type: "application/zip",
                             bytes: bytes,
                             displayName: legacy.name,
                             version: legacy.version,
-                            sourceUrl: legacy.sourceUrl
+                            sourceUrl: legacy.sourceUrl,
+                            // Reuse the legacy record's own id when the archive itself doesn't
+                            // carry a detectable manifest id, so migration overwrites the
+                            // existing record instead of creating a second one alongside it.
+                            preferredId: legacy.id
                         });
+                        // Safety net: if migration still landed under a different id than the
+                        // legacy record (e.g. it originally had no id and one was minted from
+                        // the display name), carry the enabled state over and remove the stale
+                        // legacy record so the same mod's content doesn't get injected twice.
+                        for (const mod of installed) {
+                            if (mod.id !== legacy.id) {
+                                mod.enabled = legacy.enabled ?? true;
+                                await putMod(mod);
+                            }
+                        }
+                        if (!installed.some(mod => mod.id === legacy.id)) {
+                            await deleteMod(legacy.id);
+                        }
                     } catch (error) {
                         legacy.warnings = [ ...legacy.warnings ?? [], `Metadata and texture migration failed: ${String(error)}` ];
                         legacy.compatibilityStatus = "limited";
@@ -1576,6 +1621,7 @@ end`;
                 }
                 stored = await getMods();
             }
+            stored = await dedupeStoredMods(stored);
             const requested = safeMode ? [] : dependencyOrder(stored.filter(mod => mod.enabled));
             const archive = await window.JSZip.loadAsync(arrayBuffer);
             await normalizeGameArchivePaths(archive);

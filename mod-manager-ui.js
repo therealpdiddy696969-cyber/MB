@@ -63,11 +63,14 @@
 
   async function loadFromFolder(dir, manager, onProgress) {
     const manifest = await readManifest(dir);
+    const existingIds = new Set((await manager.getMods()).map(mod => mod.id));
     const names = [];
     for await (const [name, handle] of dir.entries()) {
       if (handle.kind === "file" && /\.zip$/i.test(name)) names.push(name);
     }
     for (const name of names) {
+      const id = name.replace(/\.zip$/i, "");
+      if (existingIds.has(id)) continue; // already installed -- don't re-install and double-register content
       if (onProgress) onProgress(name);
       const fileHandle = await dir.getFileHandle(name);
       const file = await fileHandle.getFile();
