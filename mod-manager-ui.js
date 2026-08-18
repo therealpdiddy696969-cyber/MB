@@ -381,7 +381,15 @@
       handleFiles(event.dataTransfer && event.dataTransfer.files);
     });
 
+    var launched = false;
     function close(safeMode) {
+      // Guard against the launch/safe-mode buttons firing more than once
+      // (e.g. a fast double-click before the overlay is removed), which
+      // would otherwise call onLaunch -- and boot the whole game -- twice.
+      if (launched) return;
+      launched = true;
+      launchBtn.disabled = true;
+      safeModeBtn.disabled = true;
       overlay.remove();
       onLaunch(safeMode);
     }

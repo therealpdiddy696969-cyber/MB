@@ -678,18 +678,23 @@
     // Keep a single copy -- preferring whichever is enabled -- and drop the rest, so
     // its jokers/decks/tarots/etc. don't get injected into the game twice.
     async function dedupeStoredMods(stored) {
-        const keepByHash = new Map;
+        const keepByKey = new Map;
         const toDelete = [];
         for (const mod of stored) {
-            if (!mod.archiveHash) continue;
-            const existing = keepByHash.get(mod.archiveHash);
+            // Prefer the content hash when present, but fall back to a normalized
+            // name so re-installs that (for whatever reason) don't land on an
+            // identical archiveHash are still recognized as the same mod, rather
+            // than silently getting injected into the game twice.
+            const key = mod.archiveHash || `name:${normalizeId(mod.name || mod.id)}`;
+            if (!key) continue;
+            const existing = keepByKey.get(key);
             if (!existing) {
-                keepByHash.set(mod.archiveHash, mod);
+                keepByKey.set(key, mod);
                 continue;
             }
             const keep = existing.enabled || !mod.enabled ? existing : mod;
             const drop = keep === existing ? mod : existing;
-            keepByHash.set(mod.archiveHash, keep);
+            keepByKey.set(key, keep);
             toDelete.push(drop);
         }
         for (const mod of toDelete) {
@@ -891,7 +896,7 @@
         const roots = detectRoots(files, fallback, input.preferredId);
         const Zip = window.JSZip;
         const canonical = new Zip;
-        for (const file of files) canonical.file(file.path, file.bytes);
+        for (const file of files) canonical.file(file.path, file.bytes, { date: new Date(0) });
         const bytes = await canonical.generateAsync({
             type: "arraybuffer",
             compression: "DEFLATE",
@@ -1540,6 +1545,25 @@ end`;
                 archive.file(smodsUtilsPath, smodsUtils.replace(marker, `${marker}    if not t.set and t.key == 'c_base' then t.set = 'Base' end\n`));
             }
         }
+        // Steamodded's Game:init_item_prototypes hook re-runs SMODS.injectItems()
+        // (which unconditionally SMODS.insert_pool()s every mod-registered object)
+        // whenever init_item_prototypes is called after boot -- which this web
+        // build's profile-load-completion path does once, on top of the initial
+        // boot call. insert_pool() has no duplicate-key guard, so every modded
+        // joker/card/deck was ending up in its pool array twice, doubling it
+        // visually in the collection and deck-select screens even though the
+        // discovery counts (computed from the unique object dict) stayed correct.
+        // Make insert_pool idempotent per key -- an object should never
+        // legitimately appear twice in the same pool.
+        const insertPoolSource = await readText(archive, smodsUtilsPath);
+        if (insertPoolSource && !insertPoolSource.includes("-- Web: skip if this key is already present")) {
+            const insertPoolMarker = "    local prev_order = (pool[#pool] and pool[#pool].order) or 0\n    if prev_order ~= nil then\n        center.order = prev_order + 1\n    end\n    table.insert(pool, center)\nend";
+            const insertPoolGuarded = "    -- Web: skip if this key is already present -- SMODS.injectItems() can\n    -- run more than once after boot (e.g. once the save profile finishes\n    -- loading), and insert_pool is otherwise called unconditionally each time.\n    for _, existing in ipairs(pool) do\n        if existing.key == center.key then return end\n    end\n    local prev_order = (pool[#pool] and pool[#pool].order) or 0\n    if prev_order ~= nil then\n        center.order = prev_order + 1\n    end\n    table.insert(pool, center)\nend";
+            if (insertPoolSource.includes(insertPoolMarker)) {
+                archive.file(smodsUtilsPath, insertPoolSource.replace(insertPoolMarker, insertPoolGuarded));
+                console.info("[LovelyWeb] Applied SMODS.insert_pool duplicate-registration guard.");
+            }
+        }
         const originalSet = "if v.set and v.set ~= 'Joker' and not v.skip_pool and not v.omit then table.insert(self.P_CENTER_POOLS[v.set], v) end";
         const guardedSet = "if v.set and v.set ~= 'Joker' and not v.skip_pool and not v.omit and self.P_CENTER_POOLS[v.set] then table.insert(self.P_CENTER_POOLS[v.set], v) end";
         const original = "if v.rarity and v.set == 'Joker' and not v.demo then table.insert(self.P_JOKER_RARITY_POOLS[v.rarity], v) end";
@@ -1567,7 +1591,7 @@ end`;
         }
     }
     function lovelyMetadata() {
-        return `local values = {}\n\nreturn {\n    repo = 'https://github.com/ethangreen-dev/lovely-injector',\n    version = '${LOVELY_VERSION}',\n    mod_dir = 'WebMods',\n    log_file = 'smods-data/lovely/logs/web.log',\n    log_path = 'smods-data/lovely/logs/web.log',\n    web_runtime = true,\n    reload_patches = function() return true end,\n    apply_patches = function(_, buffer) return buffer end,\n    set_var = function(name, value) values[name] = tostring(value); return values[name] end,\n    get_var = function(name) return values[name] end,\n    remove_var = function(name) local value = values[name]; values[name] = nil; return value end,\n}\n`;
+        return `local values = {}\n\nreturn {\n    repo = 'https://github.com/ethangreen-dev/lovely-injector',\n    version = '${LOVELY_VERSION}',\n    mod_dir = 'WebMods',\n    log_file = 'smods-data/lovely/logs/web.log',\n    log_path = 'smods-data/lovely/logs/web.log',\n    web_runtime = true,\n    -- Patches are baked into the archive once, ahead of time, by this browser\n    -- runtime -- there is no live file-watching reload here. Reporting true\n    -- tricks Steamodded into thinking patches changed and re-running its mod\n    -- load/registration pass a second time in the same session, which is why\n    -- every joker/card was showing up twice. This must stay false.\n    reload_patches = function() return false end,\n    apply_patches = function(_, buffer) return buffer end,\n    set_var = function(name, value) values[name] = tostring(value); return values[name] end,\n    get_var = function(name) return values[name] end,\n    remove_var = function(name) local value = values[name]; values[name] = nil; return value end,\n}\n`;
     }
     function generateGameArchive(archive) {
         return archive.generateAsync({
@@ -1653,7 +1677,9 @@ end`;
             }
             if (!mods.length) return runSetupPatched ? generateGameArchive(archive) : arrayBuffer;
             try {
-                await installRawTextureSidecars(archive, mods);
+                if (!new URLSearchParams(location.search).has("lovely-no-raw-atlas")) {
+                    await installRawTextureSidecars(archive, mods);
+                }
             } catch (error) {
                 console.warn("[ModRuntime] Raw texture cache was skipped; packaged images remain available.", error);
             }
