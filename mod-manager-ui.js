@@ -2,6 +2,84 @@
   "use strict";
 
   var ACCEPTED = ".zip,.tar,.tar.gz,.tgz,application/zip,application/x-tar,application/gzip";
+  var MANIFEST_NAME = "manifest.json";
+  var supportsFolderStorage = typeof window.showDirectoryPicker === "function";
+  var modsDirHandle = null;
+
+  async function verifyReadWrite(handle) {
+    if ((await handle.queryPermission({ mode: "readwrite" })) === "granted") return true;
+    return (await handle.requestPermission({ mode: "readwrite" })) === "granted";
+  }
+
+  async function readManifest(dir) {
+    try {
+      const fileHandle = await dir.getFileHandle(MANIFEST_NAME);
+      const file = await fileHandle.getFile();
+      return JSON.parse(await file.text());
+    } catch {
+      return {};
+    }
+  }
+
+  async function writeManifest(dir, manifest) {
+    const fileHandle = await dir.getFileHandle(MANIFEST_NAME, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(JSON.stringify(manifest, null, 2));
+    await writable.close();
+  }
+
+  async function writeModFile(dir, mod) {
+    const fileHandle = await dir.getFileHandle(mod.id + ".zip", { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(mod.bytes);
+    await writable.close();
+  }
+
+  async function removeModFile(dir, id) {
+    try {
+      await dir.removeEntry(id + ".zip");
+    } catch {}
+  }
+
+  // Every mutation (install/remove/toggle) re-mirrors the full mod list to disk,
+  // so the chosen folder is always a faithful, independent copy -- immune to
+  // file:// origin instability wiping IndexedDB between sessions.
+  async function syncFolder(manager) {
+    if (!modsDirHandle) return;
+    const mods = await manager.getMods();
+    const manifest = {};
+    for (const mod of mods) {
+      manifest[mod.id] = { enabled: !!mod.enabled, name: mod.name };
+      await writeModFile(modsDirHandle, mod);
+    }
+    await writeManifest(modsDirHandle, manifest);
+    // Prune files for mods that no longer exist.
+    for await (const [name] of modsDirHandle.entries()) {
+      if (name === MANIFEST_NAME) continue;
+      const id = name.replace(/\.zip$/i, "");
+      if (!mods.some(mod => mod.id === id)) await removeModFile(modsDirHandle, id);
+    }
+  }
+
+  async function loadFromFolder(dir, manager, onProgress) {
+    const manifest = await readManifest(dir);
+    const names = [];
+    for await (const [name, handle] of dir.entries()) {
+      if (handle.kind === "file" && /\.zip$/i.test(name)) names.push(name);
+    }
+    for (const name of names) {
+      if (onProgress) onProgress(name);
+      const fileHandle = await dir.getFileHandle(name);
+      const file = await fileHandle.getFile();
+      const bytes = await file.arrayBuffer();
+      const installed = await manager.installArchive({ name: name, bytes: bytes });
+      for (const mod of installed) {
+        const saved = manifest[mod.id];
+        if (saved && saved.enabled === false) await manager.setModEnabled(mod.id, false);
+      }
+    }
+  }
+
 
   function formatBytes(bytes) {
     if (!bytes) return "0 KB";
@@ -54,6 +132,12 @@
       "background:#e9499a;color:#fff;}",
       "#modList button:hover{background:#fccfe6;color:#6e1e47;}",
       "#modEmpty{font-size:0.85rem;opacity:0.75;margin-top:10px;}",
+      "#modFolderSection{margin-top:12px;padding-top:12px;border-top:1px dashed rgba(11,86,117,0.35);}",
+      ".modFolderBtn{width:100%;border:1px solid rgb(11,86,117);border-radius:6px;padding:8px 10px;",
+      "background:rgba(255,255,255,0.4);color:rgb(11,86,117);font-size:0.82rem;font-weight:bold;cursor:pointer;}",
+      ".modFolderBtn:disabled{opacity:0.5;cursor:not-allowed;}",
+      ".modFolderBtn:not(:disabled):hover{background:rgba(255,255,255,0.7);}",
+      ".modFolderStatus{margin-top:6px;font-size:0.75rem;opacity:0.85;}",
       "#modManagerCard footer{padding:14px 20px;background:rgba(11,86,117,0.08);",
       "display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;}",
       "#modManagerCard footer .hint{font-size:0.75rem;color:rgb(28,78,104);opacity:0.8;}",
@@ -83,7 +167,9 @@
       toggle.checked = !!mod.enabled;
       toggle.title = mod.enabled ? "Disable mod" : "Enable mod";
       toggle.addEventListener("change", function() {
-        manager.setModEnabled(mod.id, toggle.checked).then(refresh);
+        manager.setModEnabled(mod.id, toggle.checked).then(function() {
+          return syncFolder(manager);
+        }).then(refresh);
       });
 
       var info = el("div", "modInfo");
@@ -108,7 +194,9 @@
       var remove = el("button", null, "Remove");
       remove.addEventListener("click", function() {
         remove.disabled = true;
-        manager.deleteMod(mod.id).then(refresh);
+        manager.deleteMod(mod.id).then(function() {
+          return syncFolder(manager);
+        }).then(refresh);
       });
 
       item.appendChild(toggle);
@@ -157,9 +245,18 @@
     dropZone.appendChild(fileInput);
     body.appendChild(dropZone);
 
+    var folderSection = el("div", "modFolderSection");
+    var folderBtn = el("button", "modFolderBtn", supportsFolderStorage ? "Use a mods folder (persists across reloads)" : "Folder-backed storage needs Chrome or Edge");
+    folderBtn.disabled = !supportsFolderStorage;
+    var folderStatus = el("div", "modFolderStatus", supportsFolderStorage ? "Not using a folder yet \u2014 mods only live in this browser's storage, which local file:// pages can lose between sessions." : "");
+    folderSection.appendChild(folderBtn);
+    folderSection.appendChild(folderStatus);
+    body.appendChild(folderSection);
+
     var statusEl = el("div");
     statusEl.id = "modStatus";
     body.appendChild(statusEl);
+
 
     var emptyEl = el("div", null, "No mods installed yet.");
     emptyEl.id = "modEmpty";
@@ -223,8 +320,9 @@
       chain
         .then(function() {
           setStatus(statusEl, "Done.", "");
-          refresh();
+          return syncFolder(manager);
         })
+        .then(refresh)
         .catch(function(error) {
           setStatus(statusEl, "Install failed: " + (error && error.message ? error.message : error), "error");
         })
@@ -240,6 +338,30 @@
     fileInput.addEventListener("change", function() {
       handleFiles(fileInput.files);
     });
+
+    if (supportsFolderStorage) {
+      folderBtn.addEventListener("click", function() {
+        window.showDirectoryPicker({ mode: "readwrite" })
+          .then(function(handle) {
+            return verifyReadWrite(handle).then(function(granted) {
+              if (!granted) throw new Error("Permission to read/write that folder was denied.");
+              modsDirHandle = handle;
+              folderStatus.textContent = "Loading mods from \u201c" + handle.name + "\u201d\u2026";
+              return loadFromFolder(handle, manager, function(name) {
+                folderStatus.textContent = "Loading " + name + "\u2026";
+              });
+            });
+          })
+          .then(function() {
+            folderStatus.textContent = "Using folder \u201c" + modsDirHandle.name + "\u201d \u2014 mods will stay in sync here across reloads.";
+            refresh();
+          })
+          .catch(function(error) {
+            if (error && error.name === "AbortError") return;
+            folderStatus.textContent = "Couldn't use that folder: " + (error && error.message ? error.message : error);
+          });
+      });
+    }
     ["dragenter", "dragover"].forEach(function(type) {
       dropZone.addEventListener(type, function(event) {
         event.preventDefault();
