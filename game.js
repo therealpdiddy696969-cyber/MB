@@ -300,12 +300,12 @@ Module.expectedDataFileDownloads++;
   }
   loadPackage({
     "package_uuid": "smods-1814a-web-v44",
-    "remote_package_size": 11497066,
+    "remote_package_size": 11497068,
     "files": [{
       "filename": "/game.love",
       "crunched": 0,
       "start": 0,
-      "end": 11497068,
+      "end": 11497048,
       "audio": false
     }]
   });
