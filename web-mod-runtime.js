@@ -1037,7 +1037,19 @@
                 skipped.push(relative);
                 continue;
             }
-            if (file && relative) gameArchive.file(`${destination}/${relative}`, await file.async("uint8array"));
+            if (file && relative) {
+                const bytes = await file.async("uint8array");
+                gameArchive.file(`${destination}/${relative}`, bytes);
+                // Web: the packed game archive is a case-sensitive zip (unlike
+                // desktop Windows/macOS filesystems), so a mod that references
+                // an asset with different casing than the file actually has
+                // (e.g. requiring "Sound.ogg" when the file is "sound.ogg")
+                // would otherwise show up as "missing" only in the browser.
+                // Also register a lowercase alias so case-mismatched lookups
+                // still resolve.
+                const lower = relative.toLowerCase();
+                if (lower !== relative) gameArchive.file(`${destination}/${lower}`, bytes);
+            }
         }
         if (skipped.length) {
             const warning = `${skipped.length} desktop-only native ${skipped.length === 1 ? "file was" : "files were"} ignored for the browser launch.`;
@@ -1555,6 +1567,34 @@ end`;
         // discovery counts (computed from the unique object dict) stayed correct.
         // Make insert_pool idempotent per key -- an object should never
         // legitimately appear twice in the same pool.
+        // Steamodded's SMODS.Sound:inject() (WebMods/Steamodded/src/game_object.lua)
+        // only stages a mod's decoded audio if G.SOUND_MANAGER.channel exists.
+        // This browser port force-disables the threaded sound manager
+        // (globals.lua sets F_SOUND_THREAD = false for the Web OS), so
+        // G.SOUND_MANAGER never exists and every modded sound was silently
+        // never loaded, then failed as "missing" the moment something tried
+        // to play it. Stash the decoded data in a plain global table instead
+        // of requiring the (nonexistent) channel.
+        const gameObjectPath = "WebMods/Steamodded/src/game_object.lua";
+        const gameObjectSource = await readText(archive, gameObjectPath);
+        if (gameObjectSource && !gameObjectSource.includes("_G.SMODS_Sounds = _G.SMODS_Sounds or {}")) {
+            const soundInjectOld = "        inject = function(self)\n            local file_path = type(self.path) == 'table' and\n                ((G.SETTINGS.real_language and self.path[G.SETTINGS.real_language]) or self.path[G.SETTINGS.language] or self.path['default'] or self.path['en-us']) or self.path\n            if file_path == 'DEFAULT' then return end\n            -- This browser port disables Balatro's threaded sound manager.\n            if not G.SOUND_MANAGER or not G.SOUND_MANAGER.channel then return end\n            local prev_path = self.full_path\n            self.full_path = (self.path_mod or self.mod or SMODS).path ..\n                'assets/sounds/' .. file_path\n            if prev_path == self.full_path then return end\n            self.data = NFS.read('data', self.full_path)\n            --self.decoder = love.sound.newDecoder(self.data)\n            self.should_stream = string.find(self.key, 'music') or string.find(self.key, 'stream') or string.find(self.key, 'ambient')\n            --self.sound = love.audio.newSource(self.decoder, self.should_stream and 'stream' or 'static')\n            if prev_path then G.SOUND_MANAGER.channel:push({ type = 'stop' }) end\n            G.SOUND_MANAGER.channel:push({ type = 'sound_source', sound_code = self.sound_code, data = self.data, should_stream = self.should_stream, per = self.pitch, vol = self.volume })\n        end,";
+            const soundInjectNew = "        inject = function(self)\n            local file_path = type(self.path) == 'table' and\n                ((G.SETTINGS.real_language and self.path[G.SETTINGS.real_language]) or self.path[G.SETTINGS.language] or self.path['default'] or self.path['en-us']) or self.path\n            if file_path == 'DEFAULT' then return end\n            local prev_path = self.full_path\n            self.full_path = (self.path_mod or self.mod or SMODS).path ..\n                'assets/sounds/' .. file_path\n            if prev_path == self.full_path then return end\n            -- Web: this build's SMODS/nativefs.lua shim doesn't support LOVE's\n            -- read(containerType, name) form -- NFS.read('data', self.full_path)\n            -- treated 'data' as a literal filename and always returned nil, so\n            -- self.data (and everything downstream) silently never had audio.\n            -- The single-argument form correctly returns the file's contents.\n            self.data = NFS.read(self.full_path)\n            self.should_stream = string.find(self.key, 'music') or string.find(self.key, 'stream') or string.find(self.key, 'ambient')\n            -- Web: this browser port disables Balatro's threaded sound manager, so\n            -- G.SOUND_MANAGER never exists and the sound_source message below would\n            -- otherwise never be delivered, silently dropping every modded sound.\n            -- Stash the decoded data in the same global table the non-threaded\n            -- PLAY_SOUND fallback checks (mirroring what the real sound thread's\n            -- SMODS_Sounds table does on desktop).\n            _G.SMODS_Sounds = _G.SMODS_Sounds or {}\n            _G.SMODS_Sounds[self.sound_code] = { data = self.data, should_stream = self.should_stream, per = self.pitch, vol = self.volume }\n            if not G.SOUND_MANAGER or not G.SOUND_MANAGER.channel then return end\n            if prev_path then G.SOUND_MANAGER.channel:push({ type = 'stop' }) end\n            G.SOUND_MANAGER.channel:push({ type = 'sound_source', sound_code = self.sound_code, data = self.data, should_stream = self.should_stream, per = self.pitch, vol = self.volume })\n        end,";
+            if (gameObjectSource.includes(soundInjectOld)) {
+                archive.file(gameObjectPath, gameObjectSource.replace(soundInjectOld, soundInjectNew));
+                console.info("[LovelyWeb] Applied SMODS.Sound web audio-loading patch.");
+            }
+        }
+        const miscFunctionsPath = "functions/misc_functions.lua";
+        const miscFunctionsSource = await readText(archive, miscFunctionsPath);
+        if (miscFunctionsSource && !miscFunctionsSource.includes("web_modded_sound")) {
+            const playSoundOld = "function PLAY_SOUND(args)\r\n  args.per = args.per or 1\r\n  args.vol = args.vol or 1\r\n  SOURCES[args.sound_code] = SOURCES[args.sound_code] or {}\r\n\r\n  local should_stream = (string.find(args.sound_code,'music') or string.find(args.sound_code,'ambient'))\r\n  local s = {sound = love.audio.newSource(\"resources/sounds/\"..args.sound_code..'.ogg', should_stream and \"stream\" or 'static')}\r\n  table.insert(SOURCES[args.sound_code], s)";
+            const playSoundNew = "function PLAY_SOUND(args)\r\n  args.per = args.per or 1\r\n  args.vol = args.vol or 1\r\n  SOURCES[args.sound_code] = SOURCES[args.sound_code] or {}\r\n\r\n  local should_stream = (string.find(args.sound_code,'music') or string.find(args.sound_code,'ambient'))\r\n  -- Web: check for modded sound data staged by SMODS.Sound:inject() (see\r\n  -- game_object.lua) before falling back to the base game's bundled\r\n  -- resources/sounds path, which never contains mod audio.\r\n  local web_modded_sound = _G.SMODS_Sounds and _G.SMODS_Sounds[args.sound_code]\r\n  local web_sound_ok, web_sound\r\n  if web_modded_sound and web_modded_sound.data then\r\n    web_sound_ok, web_sound = pcall(function()\r\n      -- love.sound.newDecoder needs a filename/File/FileData, not the raw\r\n      -- Data/string NFS.read() returns -- wrap it first.\r\n      local file_data = love.filesystem.newFileData(web_modded_sound.data, args.sound_code..'.ogg')\r\n      return love.audio.newSource(love.sound.newDecoder(file_data), web_modded_sound.should_stream and 'stream' or 'static')\r\n    end)\r\n  end\r\n  local s = (web_sound_ok and web_sound) and {sound = web_sound} or\r\n    {sound = love.audio.newSource(\"resources/sounds/\"..args.sound_code..'.ogg', should_stream and \"stream\" or 'static')}\r\n  table.insert(SOURCES[args.sound_code], s)";
+            if (miscFunctionsSource.includes(playSoundOld)) {
+                archive.file(miscFunctionsPath, miscFunctionsSource.replace(playSoundOld, playSoundNew));
+                console.info("[LovelyWeb] Applied web PLAY_SOUND modded-audio patch.");
+            }
+        }
         const insertPoolSource = await readText(archive, smodsUtilsPath);
         if (insertPoolSource && !insertPoolSource.includes("-- Web: skip if this key is already present")) {
             const insertPoolMarker = "    local prev_order = (pool[#pool] and pool[#pool].order) or 0\n    if prev_order ~= nil then\n        center.order = prev_order + 1\n    end\n    table.insert(pool, center)\nend";
