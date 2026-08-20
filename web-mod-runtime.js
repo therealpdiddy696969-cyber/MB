@@ -1595,6 +1595,26 @@ end`;
                 console.info("[LovelyWeb] Applied web PLAY_SOUND modded-audio patch.");
             }
         }
+        const cardLuaPath = "card.lua";
+        const cardLuaSource = await readText(archive, cardLuaPath);
+        if (cardLuaSource && !cardLuaSource.includes("web_seal_obj")) {
+            // Web: WebMods/Steamodded/lovely/seal.toml is a Lovely-injector
+            // source patch meant to make Card:calculate_seal dispatch to a
+            // custom SMODS seal's own :calculate(). This runtime's
+            // lovelyMetadata().apply_patches is a no-op passthrough, so this
+            // (and every other .toml patch) never actually applies -- a
+            // modded seal's icon shows fine, but its scoring effect never
+            // fires at all, since Card:calculate_seal stays 100% vanilla
+            // (only recognizes hardcoded Red/Blue/Gold/Purple). Apply the
+            // dispatch logic directly against this build's actual source
+            // (the .toml's own anchor text doesn't even match this card.lua).
+            const calcSealOld = "function Card:calculate_seal(context)\n    if context.repetition then";
+            const calcSealNew = "function Card:calculate_seal(context)\n    -- Web: WebMods/Steamodded/lovely/seal.toml patches Card:calculate_seal to\n    -- dispatch to a custom SMODS seal's own :calculate(), but this browser\n    -- build never applies any Lovely (.toml) patches (apply_patches is a\n    -- no-op) -- so a modded seal's icon shows, but its scoring effect was\n    -- never being invoked at all. Mirror that patch's logic directly.\n    local web_seal_obj = G.P_SEALS[self.seal] or {}\n    if web_seal_obj.calculate and type(web_seal_obj.calculate) == 'function' then\n        local web_seal_o, web_seal_t = web_seal_obj:calculate(self, context)\n        if web_seal_o and not web_seal_o.card then web_seal_o.card = self end\n        if web_seal_o or web_seal_t then return web_seal_o, web_seal_t end\n    end\n    if context.repetition then";
+            if (cardLuaSource.includes(calcSealOld)) {
+                archive.file(cardLuaPath, cardLuaSource.replace(calcSealOld, calcSealNew));
+                console.info("[LovelyWeb] Applied custom-seal scoring dispatch patch (seal.toml equivalent).");
+            }
+        }
         const insertPoolSource = await readText(archive, smodsUtilsPath);
         if (insertPoolSource && !insertPoolSource.includes("-- Web: skip if this key is already present")) {
             const insertPoolMarker = "    local prev_order = (pool[#pool] and pool[#pool].order) or 0\n    if prev_order ~= nil then\n        center.order = prev_order + 1\n    end\n    table.insert(pool, center)\nend";
